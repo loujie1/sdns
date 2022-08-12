@@ -140,9 +140,9 @@ func (r *Resolver) parseOutBoundAddrs(cfg *config.Config) {
 }
 
 // Resolve iterate recursively over the domains
-func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache.AuthServers, root bool, depth int, level int, nomin bool, parentdsrr []dns.RR, extra ...bool) (*dns.Msg, error) {
+func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache.AuthServers, root bool, depth int, level int, nomin bool, parentdsrr []dns.RR, addtional []dns.RR, extra ...bool) (*dns.Msg, error) {
 	q := req.Question[0]
-
+	addtional = append(addtional, parentdsrr...)
 	if root {
 		servers, parentdsrr, level = r.searchCache(q, req.CheckingDisabled, q.Name)
 	}
@@ -157,7 +157,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 	if err != nil {
 		if minimized {
 			// return without minimized
-			return r.Resolve(ctx, req, servers, false, depth, level, true, parentdsrr, extra...)
+			return r.Resolve(ctx, req, servers, false, depth, level, true, parentdsrr, addtional, extra...)
 		}
 
 		if _, ok := err.(fatalError); ok {
@@ -170,7 +170,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 
 			if atomic.AddUint32(&servers.ErrorCount, 1) == 5 {
 				if ok := r.checkNss(ctx, servers); ok {
-					return r.Resolve(ctx, req, servers, root, depth, level, nomin, parentdsrr, extra...)
+					return r.Resolve(ctx, req, servers, root, depth, level, nomin, parentdsrr, addtional, extra...)
 				}
 			}
 		}
@@ -182,7 +182,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 	if resp.Rcode != dns.RcodeSuccess && len(resp.Answer) == 0 && len(resp.Ns) == 0 {
 		if minimized {
 			level++
-			return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr)
+			return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr, addtional)
 		}
 		return resp, nil
 	}
@@ -197,12 +197,12 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 			return r.authority(ctx, req, resp, parentdsrr, req.Question[0].Qtype)
 		}
 
-		return r.answer(ctx, req, resp, parentdsrr, extra...)
+		return r.answer(ctx, req, resp, parentdsrr, addtional, extra...)
 	}
 
 	if minimized && (len(resp.Answer) == 0 && len(resp.Ns) == 0) || len(resp.Answer) > 0 {
 		level++
-		return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr)
+		return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr, addtional)
 	}
 
 	if len(resp.Ns) > 0 {
@@ -210,12 +210,12 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 			for _, rr := range resp.Ns {
 				if _, ok := rr.(*dns.SOA); ok {
 					level++
-					return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr)
+					return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr, addtional)
 				}
 
 				if _, ok := rr.(*dns.CNAME); ok {
 					level++
-					return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr)
+					return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr, addtional)
 				}
 			}
 		}
@@ -271,15 +271,19 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 
 			return nil, err
 		} else if len(parentdsrr) > 0 {
+			var dnssec []dns.RR
 			if !req.CheckingDisabled {
-				_, err := r.verifyDNSSEC(ctx, signer, nsrr.Header().Name, resp, parentdsrr)
+				_, err, dnssec = r.verifyDNSSEC(ctx, signer, nsrr.Header().Name, resp, parentdsrr)
 				if err != nil {
 					log.Warn("DNSSEC verify failed (delegation)", "query", formatQuestion(q), "signer", signer, "signed", nsrr.Header().Name, "error", err.Error())
 					return nil, err
 				}
 			}
-
+			addtional = append(addtional, dnssec...)
 			parentdsrr = extractRRSet(resp.Ns, nsrr.Header().Name, dns.TypeDS)
+
+			parentdsrrSig := extractRRSet(resp.Ns, nsrr.Header().Name, dns.TypeRRSIG)
+			parentdsrr = append(parentdsrr, parentdsrrSig...)
 
 			nsec3Set := extractRRSet(resp.Ns, "", dns.TypeNSEC3)
 			if len(nsec3Set) > 0 {
@@ -305,7 +309,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 		if level > nlevel {
 			if r.qnameMinLevel > 0 && !nomin {
 				//try without minimization
-				return r.Resolve(ctx, req, r.rootservers, true, depth, 0, true, nil, extra...)
+				return r.Resolve(ctx, req, r.rootservers, true, depth, 0, true, nil, nil, extra...)
 			}
 			return resp, errParentDetection
 		}
@@ -333,7 +337,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 			}
 
 			level++
-			return r.Resolve(ctx, req, ncache.Servers, false, depth, level, nomin, ncache.DSRR)
+			return r.Resolve(ctx, req, ncache.Servers, false, depth, level, nomin, ncache.DSRR, addtional)
 		}
 
 		log.Debug("Nameserver cache not found", "key", key, "query", formatQuestion(q), "cd", cd)
@@ -347,7 +351,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 		if len(authservers.List) == 0 {
 			if minimized && level < nlevel {
 				level++
-				return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr)
+				return r.Resolve(ctx, req, servers, false, depth, level, nomin, parentdsrr, addtional)
 			}
 
 			return nil, errors.New("nameservers are unreachable")
@@ -368,7 +372,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 			return nil, errMaxDepth
 		}
 
-		return r.Resolve(ctx, req, authservers, false, depth, nlevel, nomin, parentdsrr)
+		return r.Resolve(ctx, req, authservers, false, depth, nlevel, nomin, parentdsrr, addtional)
 	}
 
 	// no answer, no authority. create new msg safer, sometimes received weird responses
@@ -774,7 +778,7 @@ func (r *Resolver) checkDname(ctx context.Context, resp *dns.Msg) (*dns.Msg, boo
 	return nil, false
 }
 
-func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentdsrr []dns.RR, extra ...bool) (*dns.Msg, error) {
+func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentdsrr []dns.RR, additional []dns.RR, extra ...bool) (*dns.Msg, error) {
 	if msg, ok := r.checkDname(ctx, resp); ok {
 		resp.Answer = append(resp.Answer, msg.Answer...)
 		resp.Rcode = msg.Rcode
@@ -786,6 +790,7 @@ func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentdsrr []
 
 	if !req.CheckingDisabled {
 		var err error
+		var dnssec []dns.RR
 		q := req.Question[0]
 
 		signer, signerFound := r.findRRSIG(resp, q.Name, true)
@@ -802,14 +807,18 @@ func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentdsrr []
 			log.Warn("DNSSEC verify failed (answer)", "query", formatQuestion(q), "error", errDSRecords.Error())
 			return nil, errDSRecords
 		} else if len(parentdsrr) > 0 {
-			resp.AuthenticatedData, err = r.verifyDNSSEC(ctx, signer, strings.ToLower(q.Name), resp, parentdsrr)
+			resp.AuthenticatedData, err, dnssec = r.verifyDNSSEC(ctx, signer, strings.ToLower(q.Name), resp, parentdsrr)
 			if err != nil {
 				log.Warn("DNSSEC verify failed (answer)", "query", formatQuestion(q), "error", err.Error())
 				return nil, err
 			}
+			additional = append(additional, dnssec...)
 		}
 	}
 
+	for _, apex := range additional {
+		resp.Extra = append(resp.Extra, apex)
+	}
 	resp = r.clearAdditional(req, resp, extra...)
 
 	return resp, nil
@@ -838,7 +847,8 @@ func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentdsrr
 
 			return nil, err
 		} else if len(parentdsrr) > 0 {
-			ok, err := r.verifyDNSSEC(ctx, signer, q.Name, resp, parentdsrr)
+			// TODO(lou)
+			ok, err, _ := r.verifyDNSSEC(ctx, signer, q.Name, resp, parentdsrr)
 			if err != nil {
 				log.Warn("DNSSEC verify failed (NXDOMAIN)", "query", formatQuestion(q), "error", err.Error())
 				return nil, err
@@ -1375,7 +1385,7 @@ func (r *Resolver) verifyRootKeys(msg *dns.Msg) (ok bool) {
 	return true
 }
 
-func (r *Resolver) verifyDNSSEC(ctx context.Context, signer, signed string, resp *dns.Msg, parentdsRR []dns.RR) (ok bool, err error) {
+func (r *Resolver) verifyDNSSEC(ctx context.Context, signer, signed string, resp *dns.Msg, parentdsRR []dns.RR) (ok bool, err error, dnssecRR []dns.RR) {
 	keyReq := new(dns.Msg)
 	keyReq.SetQuestion(signer, dns.TypeDNSKEY)
 	keyReq.SetEdns0(dnsutil.DefaultMsgSize, true)
@@ -1392,11 +1402,11 @@ func (r *Resolver) verifyDNSSEC(ctx context.Context, signer, signed string, resp
 	} else if q.Qtype == dns.TypeDNSKEY {
 		if q.Name == rootzone {
 			if !r.verifyRootKeys(resp) {
-				return false, fmt.Errorf("root zone keys not verified")
+				return false, fmt.Errorf("root zone keys not verified"), nil
 			}
 
 			log.Debug("Good! root keys verified and set in cache")
-			return true, nil
+			return true, nil, nil
 		}
 
 		msg = resp
@@ -1411,28 +1421,29 @@ func (r *Resolver) verifyDNSSEC(ctx context.Context, signer, signed string, resp
 				keys[tag] = dnskey
 			}
 		}
+		dnssecRR = append(dnssecRR, a)
 	}
 
 	if len(keys) == 0 {
-		return false, errNoDNSKEY
+		return false, errNoDNSKEY, nil
 	}
 
 	if len(parentdsRR) == 0 {
-		return false, fmt.Errorf("DS RR set empty")
+		return false, fmt.Errorf("DS RR set empty"), nil
 	}
 
 	unsupportedDigest, err := verifyDS(keys, parentdsRR)
 	if err != nil {
 		log.Debug("DNSSEC DS verify failed", "signer", signer, "signed", signed, "error", err.Error(), "unsupported digest", unsupportedDigest)
 		if unsupportedDigest {
-			return false, nil
+			return false, nil, nil
 		}
 		return
 	}
 
 	// we don't need to verify rrsig questions.
 	if q.Qtype == dns.TypeRRSIG {
-		return false, nil
+		return false, nil, nil
 	}
 
 	if ok, err = verifyRRSIG(keys, resp); err != nil {
@@ -1441,12 +1452,12 @@ func (r *Resolver) verifyDNSSEC(ctx context.Context, signer, signed string, resp
 
 	//TODO (semih): there is exponent problem in golang lib, we can't verify this.
 	if !ok {
-		return false, nil
+		return false, nil, nil
 	}
 
 	log.Debug("DNSSEC verified", "signer", signer, "signed", signed, "query", formatQuestion(resp.Question[0]))
 
-	return true, nil
+	return true, nil, dnssecRR
 }
 
 func (r *Resolver) clearAdditional(req, resp *dns.Msg, extra ...bool) *dns.Msg {
@@ -1458,7 +1469,7 @@ func (r *Resolver) clearAdditional(req, resp *dns.Msg, extra ...bool) *dns.Msg {
 	}
 
 	if noclear {
-		resp.Extra = []dns.RR{}
+		//resp.Extra = []dns.RR{}
 
 		opt := req.IsEdns0()
 		if opt != nil {
@@ -1512,7 +1523,7 @@ func (r *Resolver) checkPriming() {
 		panic("root servers list empty. check your config file")
 	}
 
-	resp, err := r.Resolve(ctx, req, r.rootservers, true, 5, 0, false, nil, true)
+	resp, err := r.Resolve(ctx, req, r.rootservers, true, 5, 0, false, nil, nil, true)
 	if err != nil {
 		log.Error("root servers update failed", "error", err.Error())
 
