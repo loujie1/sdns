@@ -25,7 +25,7 @@ func Test_NSCache(t *testing.T) {
 	assert.Error(t, err)
 	assert.Equal(t, err.Error(), "cache not found")
 
-	nscache.Set(key, nil, servers, time.Hour)
+	nscache.Set(key, nil, servers, time.Hour, nil)
 
 	_, err = nscache.Get(key)
 	assert.NoError(t, err)

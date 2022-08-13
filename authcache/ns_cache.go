@@ -9,9 +9,10 @@ import (
 
 // NS represents a cache entry
 type NS struct {
-	Servers *AuthServers
-	DSRR    []dns.RR
-	TTL     time.Duration
+	Servers    *AuthServers
+	DSRR       []dns.RR
+	TTL        time.Duration
+	Additional []dns.RR
 
 	ut time.Time
 }
@@ -53,7 +54,7 @@ func (n *NSCache) Get(key uint64) (*NS, error) {
 }
 
 // Set sets a keys value to a NS
-func (n *NSCache) Set(key uint64, dsRR []dns.RR, servers *AuthServers, ttl time.Duration) {
+func (n *NSCache) Set(key uint64, dsRR []dns.RR, servers *AuthServers, ttl time.Duration, addtional []dns.RR) {
 	if ttl > maximumTTL {
 		ttl = maximumTTL
 	} else if ttl < minimumTTL {
@@ -61,10 +62,11 @@ func (n *NSCache) Set(key uint64, dsRR []dns.RR, servers *AuthServers, ttl time.
 	}
 
 	n.cache.Add(key, &NS{
-		Servers: servers,
-		DSRR:    dsRR,
-		TTL:     ttl,
-		ut:      n.now().UTC().Round(time.Second),
+		Servers:    servers,
+		DSRR:       dsRR,
+		TTL:        ttl,
+		Additional: addtional,
+		ut:         n.now().UTC().Round(time.Second),
 	})
 }
 

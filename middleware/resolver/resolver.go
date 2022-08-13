@@ -142,9 +142,9 @@ func (r *Resolver) parseOutBoundAddrs(cfg *config.Config) {
 // Resolve iterate recursively over the domains
 func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache.AuthServers, root bool, depth int, level int, nomin bool, parentdsrr []dns.RR, addtional []dns.RR, extra ...bool) (*dns.Msg, error) {
 	q := req.Question[0]
-	addtional = append(addtional, parentdsrr...)
+
 	if root {
-		servers, parentdsrr, level = r.searchCache(q, req.CheckingDisabled, q.Name)
+		servers, parentdsrr, level, addtional = r.searchCache(q, req.CheckingDisabled, q.Name)
 	}
 
 	// RFC 7816 query minimization. There are some concerns in RFC.
@@ -194,7 +194,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 		}
 
 		if resp.Rcode == dns.RcodeNameError {
-			return r.authority(ctx, req, resp, parentdsrr, req.Question[0].Qtype)
+			return r.authority(ctx, req, resp, parentdsrr, req.Question[0].Qtype, addtional)
 		}
 
 		return r.answer(ctx, req, resp, parentdsrr, addtional, extra...)
@@ -236,7 +236,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 		}
 
 		if len(nss) == 0 {
-			return r.authority(ctx, minReq, resp, parentdsrr, q.Qtype)
+			return r.authority(ctx, minReq, resp, parentdsrr, q.Qtype, addtional)
 		}
 
 		if soa {
@@ -249,7 +249,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 					resp.Ns = append(resp.Ns, rr)
 				}
 			}
-			return r.authority(ctx, minReq, resp, parentdsrr, q.Qtype)
+			return r.authority(ctx, minReq, resp, parentdsrr, q.Qtype, addtional)
 		}
 
 		q = dns.Question{Name: nsrr.Header().Name, Qtype: nsrr.Header().Rrtype, Qclass: nsrr.Header().Class}
@@ -281,9 +281,10 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 			}
 			addtional = append(addtional, dnssec...)
 			parentdsrr = extractRRSet(resp.Ns, nsrr.Header().Name, dns.TypeDS)
+			addtional = append(addtional, parentdsrr...)
 
 			parentdsrrSig := extractRRSet(resp.Ns, nsrr.Header().Name, dns.TypeRRSIG)
-			parentdsrr = append(parentdsrr, parentdsrrSig...)
+			addtional = append(addtional, parentdsrrSig...)
 
 			nsec3Set := extractRRSet(resp.Ns, "", dns.TypeNSEC3)
 			if len(nsec3Set) > 0 {
@@ -337,7 +338,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 			}
 
 			level++
-			return r.Resolve(ctx, req, ncache.Servers, false, depth, level, nomin, ncache.DSRR, addtional)
+			return r.Resolve(ctx, req, ncache.Servers, false, depth, level, nomin, ncache.DSRR, ncache.Additional)
 		}
 
 		log.Debug("Nameserver cache not found", "key", key, "query", formatQuestion(q), "cd", cd)
@@ -346,7 +347,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 		authservers.CheckingDisable = cd
 		authservers.Zone = q.Name
 
-		r.lookupV4Nss(ctx, q, authservers, key, parentdsrr, foundv4, nss, cd)
+		r.lookupV4Nss(ctx, q, authservers, key, parentdsrr, foundv4, nss, cd, addtional)
 
 		if len(authservers.List) == 0 {
 			if minimized && level < nlevel {
@@ -357,7 +358,7 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg, servers *authcache
 			return nil, errors.New("nameservers are unreachable")
 		}
 
-		r.ncache.Set(key, parentdsrr, authservers, time.Duration(nsrr.Header().Ttl)*time.Second)
+		r.ncache.Set(key, parentdsrr, authservers, time.Duration(nsrr.Header().Ttl)*time.Second, addtional)
 		log.Debug("Nameserver cache insert", "key", key, "query", formatQuestion(q), "cd", cd)
 
 		//copy reqid
@@ -427,7 +428,7 @@ func (r *Resolver) checkLoop(ctx context.Context, qname string, qtype uint16) (c
 	return ctx, false
 }
 
-func (r *Resolver) lookupV4Nss(ctx context.Context, q dns.Question, authservers *authcache.AuthServers, key uint64, parentdsrr []dns.RR, foundv4, nss nameservers, cd bool) {
+func (r *Resolver) lookupV4Nss(ctx context.Context, q dns.Question, authservers *authcache.AuthServers, key uint64, parentdsrr []dns.RR, foundv4, nss nameservers, cd bool, additional []dns.RR) {
 	list := sortnss(nss, q.Name)
 
 	for _, name := range list {
@@ -447,7 +448,7 @@ func (r *Resolver) lookupV4Nss(ctx context.Context, q dns.Question, authservers 
 
 		if len(authservers.List) > 0 {
 			// temprorary cache before lookup
-			r.ncache.Set(key, parentdsrr, authservers, time.Minute)
+			r.ncache.Set(key, parentdsrr, authservers, time.Minute, additional)
 		}
 
 		addrs, err := r.lookupNSAddrV4(ctx, name, cd)
@@ -784,7 +785,7 @@ func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentdsrr []
 		resp.Rcode = msg.Rcode
 
 		if len(msg.Answer) == 0 {
-			return r.authority(ctx, req, resp, parentdsrr, req.Question[0].Qtype)
+			return r.authority(ctx, req, resp, parentdsrr, req.Question[0].Qtype, additional)
 		}
 	}
 
@@ -824,7 +825,7 @@ func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentdsrr []
 	return resp, nil
 }
 
-func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentdsrr []dns.RR, otype uint16) (*dns.Msg, error) {
+func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentdsrr []dns.RR, otype uint16, additional []dns.RR) (*dns.Msg, error) {
 	if !req.CheckingDisabled {
 		var err error
 		q := req.Question[0]
@@ -848,12 +849,12 @@ func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentdsrr
 			return nil, err
 		} else if len(parentdsrr) > 0 {
 			// TODO(lou)
-			ok, err, _ := r.verifyDNSSEC(ctx, signer, q.Name, resp, parentdsrr)
+			ok, err, dnssec := r.verifyDNSSEC(ctx, signer, q.Name, resp, parentdsrr)
 			if err != nil {
 				log.Warn("DNSSEC verify failed (NXDOMAIN)", "query", formatQuestion(q), "error", err.Error())
 				return nil, err
 			}
-
+			additional = append(additional, dnssec...)
 			if ok && resp.Rcode == dns.RcodeNameError {
 				nsec3Set := extractRRSet(resp.Ns, "", dns.TypeNSEC3)
 				if len(nsec3Set) > 0 {
@@ -892,6 +893,9 @@ func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentdsrr
 				}
 			}
 		}
+	}
+	for _, apex := range additional {
+		resp.Extra = append(resp.Extra, apex)
 	}
 
 	return resp, nil
@@ -1124,7 +1128,7 @@ func (r *Resolver) newDialer(ctx context.Context, proto string, version authcach
 	return d
 }
 
-func (r *Resolver) searchCache(q dns.Question, cd bool, origin string) (servers *authcache.AuthServers, parentdsrr []dns.RR, level int) {
+func (r *Resolver) searchCache(q dns.Question, cd bool, origin string) (servers *authcache.AuthServers, parentdsrr []dns.RR, level int, addtional []dns.RR) {
 	if q.Qtype == dns.TypeDS {
 		next, end := dns.NextLabel(q.Name, 0)
 
@@ -1147,7 +1151,7 @@ func (r *Resolver) searchCache(q dns.Question, cd bool, origin string) (servers 
 			return r.searchCache(q, cd, origin)
 		}
 		log.Debug("Nameserver cache hit", "key", key, "query", formatQuestion(q), "cd", cd)
-		return ns.Servers, ns.DSRR, dns.CompareDomainName(origin, q.Name)
+		return ns.Servers, ns.DSRR, dns.CompareDomainName(origin, q.Name), ns.Additional
 	}
 
 	if !cd {
@@ -1161,14 +1165,14 @@ func (r *Resolver) searchCache(q dns.Question, cd bool, origin string) (servers 
 				return r.searchCache(q, cd, origin)
 			}
 			log.Debug("Nameserver cache hit", "key", key, "query", formatQuestion(q), "cd", true)
-			return ns.Servers, ns.DSRR, dns.CompareDomainName(origin, q.Name)
+			return ns.Servers, ns.DSRR, dns.CompareDomainName(origin, q.Name), ns.Additional
 		}
 	}
 
 	next, end := dns.NextLabel(q.Name, 0)
 
 	if end {
-		return r.rootservers, nil, 0
+		return r.rootservers, nil, 0, nil
 	}
 
 	q.Name = q.Name[next:]
