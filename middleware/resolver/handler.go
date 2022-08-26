@@ -125,7 +125,7 @@ func (h *DNSHandler) handle(ctx context.Context, req *dns.Msg) *dns.Msg {
 	}
 
 	resp = h.additionalAnswer(ctx, req, resp)
-
+	log.Debug("return to client, msg: %s\n", resp.String())
 	return resp
 }
 
